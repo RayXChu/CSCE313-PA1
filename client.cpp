@@ -15,6 +15,7 @@ Date: 9/26/2025
 
 #include <sys/wait.h>
 #include <iomanip>
+#include <memory>
 
 using namespace std;
 
@@ -24,9 +25,10 @@ int p = -1;
 double t = -1.0;
 int e = -1;
 int m = MAX_MESSAGE; // default value for capacity
+bool use_new_channel = false;
 
 string filename = "";
-while ((opt = getopt(argc, argv, "p:t:e:f:m:")) != -1) {
+while ((opt = getopt(argc, argv, "p:t:e:f:m:c")) != -1) {
 switch (opt) {
 case 'p':
 p = atoi (optarg);
@@ -40,9 +42,11 @@ break;
 case 'f':
 filename = optarg;
 break;
-// added
 case 'm':
 m = atoi(optarg); // use this in the below '-m'
+break;
+case 'c':
+use_new_channel = true;
 break;
 }
 }
@@ -74,15 +78,26 @@ _exit(1);
 
 FIFORequestChannel chan("control", FIFORequestChannel::CLIENT_SIDE);
 
+std::unique_ptr<FIFORequestChannel> data;
+if (use_new_channel) {
+    MESSAGE_TYPE nc = NEWCHANNEL_MSG;
+    chan.cwrite(&nc, sizeof(nc));
+    char newname[256] = {0};
+    chan.cread(newname, sizeof(newname));
+    data = std::make_unique<FIFORequestChannel>(newname, FIFORequestChannel::CLIENT_SIDE);
+}
+
+FIFORequestChannel* work = data ? data.get() : &chan;
+
 // Single datapoint, only run p,t,e != -1
 if (p != -1 && t != -1 && e != -1) {
 char buf[MAX_MESSAGE];
 datamsg x(p, t, e);
 
 memcpy(buf, &x, sizeof(datamsg));
-chan.cwrite(buf, sizeof(datamsg));
+work->cwrite(buf, sizeof(datamsg));
 double reply;
-chan.cread(&reply, sizeof(double));
+work->cread(&reply, sizeof(double));
 cout << "For person " << p << ", at time " << t << ", the value of ecg " << e << " is " << reply << endl;
 }
 // Else, if p != -1, request 1000 datapoints.
@@ -91,7 +106,8 @@ cout << "For person " << p << ", at time " << t << ", the value of ecg " << e <<
 // send request for ecg 2
 // write line to received/x1.csv (match format)
 else if (p != -1) {
-ofstream out("x1.csv");
+    system("mkdir -p received");
+ofstream out("received/x1.csv");
 for (int i = 0; i < 1000; ++i) {
 char buf[MAX_MESSAGE];
 double ti = i * 0.004;
@@ -99,21 +115,20 @@ double ti = i * 0.004;
 // Request ecg1
 datamsg d1(p, ti, 1);
 memcpy(buf, &d1, sizeof(datamsg));
-chan.cwrite(buf, sizeof(datamsg));
+work->cwrite(buf, sizeof(datamsg));
 double v1;
-chan.cread(&v1, sizeof(double));
+work->cread(&v1, sizeof(double));
 
 // Request ecg2
 datamsg d2(p, ti, 2);
 memcpy(buf, &d2, sizeof(datamsg));
-chan.cwrite(buf, sizeof(datamsg));
+work->cwrite(buf, sizeof(datamsg));
 double v2;
-chan.cread(&v2, sizeof(double));
+work->cread(&v2, sizeof(double));
 
 out << ti << "," << v1 << "," << v2 << "\n";
 }
 out.close();
-system("mv x1.csv received/x1.csv");
 }
 // requesting
 // one filemsg to get length
@@ -123,6 +138,7 @@ system("mv x1.csv received/x1.csv");
 // (?) compare using diff
 // test on 100mb file
 else if (!filename.empty()) {
+system("mkdir -p received");
 
 int header = sizeof(filemsg);
 int fname_bytes = filename.size() + 1;
@@ -131,10 +147,10 @@ int len = header + (fname_bytes);
 char* buf = new char[len];
 memcpy(buf, &fm, sizeof(filemsg));
 strcpy(buf + header, filename.c_str());
-chan.cwrite(buf, len);
+work->cwrite(buf, len);
 
 size_t filelen = 0;
-chan.cread(&filelen, sizeof(filelen));
+work->cread(&filelen, sizeof(filelen));
 
 vector<char> req(m);
 
@@ -143,14 +159,14 @@ string outpath = "received/" + filename;
 ofstream out(outpath, ios::binary);
 
 if (!out) {
-    MESSAGE_TYPE qm = QUIT_MSG; chan.cwrite(&qm, sizeof(qm));
+    MESSAGE_TYPE qm = QUIT_MSG; work->cwrite(&qm, sizeof(qm));
     int status = 0; waitpid(pid, &status, 0);
     return 1;
 }
 
 size_t max_payload = m - header - fname_bytes;
 if (max_payload == 0) {
-    MESSAGE_TYPE qm = QUIT_MSG; chan.cwrite(&qm, sizeof(qm));
+    MESSAGE_TYPE qm = QUIT_MSG; work->cwrite(&qm, sizeof(qm));
     int status = 0; waitpid(pid, &status, 0);
     return 1;
 }
@@ -165,8 +181,8 @@ while (remaining > 0) {
     memcpy(req.data(), &fm, header);
     strcpy(req.data() + header, filename.c_str());
 
-    chan.cwrite(req.data(), header + fname_bytes);
-    chan.cread(resp.data(), chunk);
+    work->cwrite(req.data(), header + fname_bytes);
+    work->cread(resp.data(), chunk);
     out.write(resp.data(), chunk);
 
     offset += chunk;
@@ -177,12 +193,14 @@ out.close();
 delete[] buf;
 }
 
-// closing the channel
-MESSAGE_TYPE qm = QUIT_MSG;
-chan.cwrite(&qm, sizeof(MESSAGE_TYPE));
-
-if (p == -1 && t == -1 && e == -1) {
-cout << "Client-side is done and exited\n";
+if (data) {
+    MESSAGE_TYPE q = QUIT_MSG;
+    data->cwrite(&q, sizeof(q));
+    data.reset();
+}
+{
+    MESSAGE_TYPE q = QUIT_MSG;
+    chan.cwrite(&q, sizeof(q));
 }
 
 // Reap child process
